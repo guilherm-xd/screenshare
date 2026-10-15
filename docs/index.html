@@ -1,236 +1,361 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="pt-BR">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Assistir tela</title>
-<style>
-  html, body { margin: 0; height: 100%; background: #000; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
-  video { width: 100%; height: 100%; object-fit: contain; background: #000; }
-  #status { position: fixed; top: 12px; left: 12px; right: 150px; padding: 6px 12px; background: rgba(0,0,0,.6); border-radius: 6px; font-size: 14px; display: none; }
-  #stats { position: fixed; bottom: 12px; left: 12px; padding: 6px 12px; background: rgba(0,0,0,.6); border-radius: 6px; font-family: monospace; font-size: 12px; }
-  #controls { position: fixed; top: 12px; right: 12px; display: flex; gap: 8px; }
-  #controls button { padding: 10px 14px; border: 0; border-radius: 6px; background: #3b82f6; color: #fff; font-size: 14px; }
-  #gate { position: fixed; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center; gap: 10px; background: #000; padding: 20px; }
-  #gate input, #gate button { width: 100%; max-width: 320px; box-sizing: border-box; padding: 12px 14px; font-size: 16px; border-radius: 6px; border: 0; }
-  #gate button { background: #3b82f6; color: #fff; }
-  #msg { font-size: 14px; color: #f87171; min-height: 18px; text-align: center; }
-</style>
-</head>
-<body>
-<video id="video" autoplay playsinline muted></video>
-<div id="status"></div>
-<div id="stats"></div>
-<div id="controls">
-  <button id="unmute">Som</button>
-  <button id="full">Tela cheia</button>
-</div>
-<div id="gate">
-  <div id="msg"></div>
-  <input id="server" type="text" placeholder="Endereço do servidor" autocapitalize="off" autocorrect="off">
-  <input id="key" type="password" placeholder="Chave de acesso">
-  <button id="enter">Entrar</button>
-</div>
-
-<script>
-const video = document.getElementById('video');
-const statusEl = document.getElementById('status');
-const statsEl = document.getElementById('stats');
-const gate = document.getElementById('gate');
-const msgEl = document.getElementById('msg');
-const serverInput = document.getElementById('server');
-const keyInput = document.getElementById('key');
-
-const params = new URLSearchParams(location.search);
-const onPages = location.hostname.endsWith('github.io');
-
-function normalize(value) {
-  return value.trim().replace(/^[a-z]+:\/\//i, '').replace(/\/.*$/, '');
-}
-
-let server = params.get('s') ? normalize(params.get('s')) : (onPages ? '' : location.host);
-const serverLocked = !!server;
-
-let viewerKey = '';
-let iceServers = [];
-let pc = null;
-let ws = null;
-let statsTimer = null;
-let retryTimer = null;
-let stopped = false;
-let queue = Promise.resolve();
-let pendingCandidates = [];
-
-function endpoints() {
-  const secure = server === location.host ? location.protocol === 'https:' : true;
-  return {
-    http: `${secure ? 'https' : 'http'}://${server}`,
-    ws: `${secure ? 'wss' : 'ws'}://${server}`
-  };
-}
-
-function setStatus(text) {
-  statusEl.textContent = text;
-  statusEl.style.display = text ? 'block' : 'none';
-}
-
-function showGate(message) {
-  msgEl.textContent = message || '';
-  serverInput.style.display = serverLocked ? 'none' : '';
-  gate.style.display = 'flex';
-}
-
-function send(data) {
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
-}
-
-function closePeer() {
-  if (pc) pc.close();
-  pc = null;
-  clearInterval(statsTimer);
-  video.srcObject = null;
-  statsEl.textContent = '';
-}
-
-async function handle(msg) {
-  if (msg.type === 'waiting') setStatus('Aguardando o host iniciar...');
-
-  if (msg.type === 'host-left') {
-    closePeer();
-    pendingCandidates = [];
-    setStatus('O host encerrou a transmissão. Aguardando...');
-  }
-
-  if (msg.type === 'offer') {
-    closePeer();
-    setStatus('Conectando...');
-    const current = new RTCPeerConnection({ iceServers });
-    pc = current;
-
-    current.onicecandidate = (e) => {
-      if (e.candidate) send({ type: 'candidate', candidate: e.candidate });
-    };
-
-    current.onconnectionstatechange = () => {
-      const state = current.connectionState;
-      if (state === 'connected') setStatus('');
-      if (state === 'connecting') setStatus('Conectando...');
-      if (state === 'disconnected') setStatus('Conexão instável...');
-      if (state === 'failed') setStatus('Falha na conexão direta. Pode ser necessário um servidor TURN.');
-    };
-
-    current.ontrack = (e) => {
-      video.srcObject = e.streams[0];
-      video.play().catch(() => {});
-    };
-
-    await current.setRemoteDescription(msg.sdp);
-    for (const c of pendingCandidates) {
-      await current.addIceCandidate(c).catch(() => {});
-    }
-    pendingCandidates = [];
-
-    const answer = await current.createAnswer();
-    await current.setLocalDescription(answer);
-    send({ type: 'answer', sdp: current.localDescription });
-
-    current.getReceivers().forEach((r) => {
-      if ('playoutDelayHint' in r) r.playoutDelayHint = 0;
-      if ('jitterBufferTarget' in r) r.jitterBufferTarget = 0;
-    });
-
-    statsTimer = setInterval(showStats, 1000);
-  }
-
-  if (msg.type === 'candidate' && msg.candidate) {
-    if (pc && pc.remoteDescription) await pc.addIceCandidate(msg.candidate).catch(() => {});
-    else pendingCandidates.push(msg.candidate);
-  }
-}
-
-async function showStats() {
-  if (!pc) return;
-  const report = await pc.getStats();
-  report.forEach((r) => {
-    if (r.type === 'inbound-rtp' && r.kind === 'video') {
-      statsEl.textContent = `${r.frameWidth || 0}x${r.frameHeight || 0} @ ${Math.round(r.framesPerSecond || 0)}fps`;
-    }
-  });
-}
-
-function connect() {
-  clearTimeout(retryTimer);
-  stopped = false;
-  if (ws) {
-    ws.onclose = null;
-    ws.close();
-  }
-  ws = new WebSocket(endpoints().ws);
-  ws.onopen = () => send({ type: 'viewer', key: viewerKey });
-  ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-    if (msg.type === 'denied' || msg.type === 'replaced') {
-      stopped = true;
-      closePeer();
-      if (msg.type === 'denied') {
-        viewerKey = '';
-        showGate(msg.blocked ? 'Muitas tentativas. Aguarde 10 minutos.' : 'Chave incorreta');
-      } else {
-        setStatus('Aberto em outra aba ou aparelho. Recarregue para assistir aqui.');
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Compartilhar tela</title>
+    <style>
+      body {
+        margin: 0;
+        background: #111;
+        color: #eee;
+        font-family: system-ui, sans-serif;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 12px;
+        padding: 16px;
       }
-      return;
-    }
-    queue = queue.then(() => handle(msg)).catch(console.error);
-  };
-  ws.onclose = () => {
-    if (stopped) return;
-    closePeer();
-    pendingCandidates = [];
-    setStatus('Reconectando...');
-    retryTimer = setTimeout(connect, 3000);
-  };
-}
+      video {
+        width: 100%;
+        max-width: 960px;
+        background: #000;
+        border-radius: 8px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+      button,
+      select,
+      input {
+        padding: 10px 14px;
+        font-size: 15px;
+        border-radius: 6px;
+        border: 0;
+      }
+      button {
+        background: #3b82f6;
+        color: #fff;
+        cursor: pointer;
+      }
+      button:disabled {
+        background: #444;
+        cursor: default;
+      }
+      #stats {
+        font-family: monospace;
+        font-size: 13px;
+        opacity: 0.85;
+        text-align: center;
+        line-height: 1.6;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="row">
+      <input id="key" type="password" placeholder="HOST_KEY" />
+      <button id="start">Iniciar compartilhamento</button>
+      <button id="stop" disabled>Parar</button>
+    </div>
+    <div class="row">
+      <label
+        >Codec
+        <select id="codec">
+          <option value="VP8" selected>VP8 (leve em software)</option>
+          <option value="H264">H264 (melhor no celular)</option>
+          <option value="VP9">VP9 (pesado)</option>
+        </select>
+      </label>
+      <label
+        >Bitrate
+        <select id="bitrate">
+          <option value="5000000">5 Mbps</option>
+          <option value="10000000">10 Mbps</option>
+          <option value="15000000" selected>15 Mbps</option>
+          <option value="25000000">25 Mbps</option>
+          <option value="40000000">40 Mbps</option>
+        </select>
+      </label>
+    </div>
+    <video id="preview" autoplay muted playsinline></video>
+    <div id="stats">Parado</div>
 
-async function enter() {
-  if (!serverLocked) server = normalize(serverInput.value);
-  if (!server) {
-    msgEl.textContent = 'Informe o endereço do servidor';
-    return;
-  }
-  if (!keyInput.value) {
-    msgEl.textContent = 'Informe a chave de acesso';
-    return;
-  }
-  viewerKey = keyInput.value;
-  try {
-    const res = await fetch(`${endpoints().http}/config`);
-    const config = await res.json();
-    iceServers = config.iceServers;
-  } catch (e) {
-    msgEl.textContent = 'Não foi possível alcançar o servidor';
-    return;
-  }
-  gate.style.display = 'none';
-  setStatus('Conectando...');
-  connect();
-}
+    <script>
+      const startBtn = document.getElementById("start");
+      const stopBtn = document.getElementById("stop");
+      const bitrateSel = document.getElementById("bitrate");
+      const codecSel = document.getElementById("codec");
+      const keyInput = document.getElementById("key");
+      const preview = document.getElementById("preview");
+      const statsEl = document.getElementById("stats");
 
-document.getElementById('enter').onclick = enter;
-keyInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') enter();
-});
+      let ws = null;
+      let stream = null;
+      let wanted = false;
+      let retryTimer = null;
+      let queue = Promise.resolve();
+      let iceServers = [];
+      let captureInfo = "";
+      let outInfo = "";
+      let notice = "";
+      let lastBytes = 0;
+      let lastTime = 0;
+      const peers = new Map();
 
-document.getElementById('unmute').onclick = (e) => {
-  video.muted = !video.muted;
-  e.target.textContent = video.muted ? 'Som' : 'Mudo';
-};
+      function send(data) {
+        if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
+      }
 
-document.getElementById('full').onclick = () => {
-  if (video.requestFullscreen) video.requestFullscreen();
-  else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen();
-};
+      function render() {
+        const first = peers.values().next().value;
+        const state = first ? first.connectionState : "sem espectador";
+        const lines = [
+          captureInfo,
+          `Espectador: ${state}`,
+          outInfo,
+          notice,
+        ].filter(Boolean);
+        statsEl.innerHTML = lines.join("<br>");
+      }
 
-showGate('');
-</script>
-</body>
+      async function tuneSender(sender) {
+        const params = sender.getParameters();
+        if (!params.encodings || !params.encodings.length)
+          params.encodings = [{}];
+        params.encodings[0].maxBitrate = Number(bitrateSel.value);
+        params.encodings[0].maxFramerate = 60;
+        params.degradationPreference = "maintain-framerate";
+        try {
+          await sender.setParameters(params);
+        } catch (e) {
+          console.warn(e);
+        }
+      }
+
+      function preferCodec(pc) {
+        const wanted = "video/" + codecSel.value.toLowerCase();
+        const transceiver = pc
+          .getTransceivers()
+          .find((t) => t.sender.track && t.sender.track.kind === "video");
+        if (!transceiver || !transceiver.setCodecPreferences) return;
+        const codecs = RTCRtpSender.getCapabilities("video").codecs;
+        const first = codecs.filter((c) => c.mimeType.toLowerCase() === wanted);
+        const rest = codecs.filter((c) => c.mimeType.toLowerCase() !== wanted);
+        if (first.length) transceiver.setCodecPreferences([...first, ...rest]);
+      }
+
+      async function createPeer(id) {
+        if (peers.has(id)) removePeer(id);
+        const pc = new RTCPeerConnection({ iceServers });
+        peers.set(id, pc);
+        lastTime = 0;
+
+        pc.onicecandidate = (e) => {
+          if (e.candidate)
+            send({ type: "candidate", to: id, candidate: e.candidate });
+        };
+
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === "failed") {
+            notice =
+              "Falha na conexão direta. Se persistir, configure um servidor TURN.";
+          }
+          if (pc.connectionState === "connected") notice = "";
+          render();
+        };
+
+        stream.getTracks().forEach((track) => {
+          if (track.kind === "video") track.contentHint = "motion";
+          pc.addTrack(track, stream);
+        });
+
+        preferCodec(pc);
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        send({ type: "offer", to: id, sdp: pc.localDescription });
+        render();
+      }
+
+      function removePeer(id) {
+        const pc = peers.get(id);
+        if (pc) pc.close();
+        peers.delete(id);
+        lastTime = 0;
+        render();
+      }
+
+      function closePeers() {
+        peers.forEach((pc) => pc.close());
+        peers.clear();
+        lastTime = 0;
+        render();
+      }
+
+      async function handle(msg) {
+        if (msg.type === "denied") {
+          notice = msg.blocked
+            ? "Muitas tentativas erradas. Aguarde 10 minutos."
+            : "HOST_KEY incorreta.";
+          stop();
+          return;
+        }
+
+        if (msg.type === "viewer-joined") await createPeer(msg.id);
+
+        if (msg.type === "answer") {
+          const pc = peers.get(msg.from);
+          if (!pc || !msg.sdp) return;
+          await pc.setRemoteDescription(msg.sdp);
+          pc.getSenders()
+            .filter((s) => s.track && s.track.kind === "video")
+            .forEach(tuneSender);
+        }
+
+        if (msg.type === "candidate") {
+          const pc = peers.get(msg.from);
+          if (pc && pc.remoteDescription && msg.candidate) {
+            await pc.addIceCandidate(msg.candidate).catch(() => {});
+          }
+        }
+
+        if (msg.type === "viewer-left") removePeer(msg.id);
+      }
+
+      function openSocket() {
+        clearTimeout(retryTimer);
+        const proto = location.protocol === "https:" ? "wss" : "ws";
+        ws = new WebSocket(`${proto}://${location.host}`);
+        ws.onopen = () => {
+          notice = "";
+          send({ type: "host", key: keyInput.value });
+        };
+        ws.onmessage = (ev) => {
+          const msg = JSON.parse(ev.data);
+          queue = queue.then(() => handle(msg)).catch(console.error);
+        };
+        ws.onclose = () => {
+          if (!wanted) return;
+          closePeers();
+          notice = "Reconectando ao servidor...";
+          render();
+          retryTimer = setTimeout(openSocket, 3000);
+        };
+      }
+
+      async function start() {
+        if (!keyInput.value) {
+          notice = "Informe a HOST_KEY.";
+          render();
+          return;
+        }
+
+        if (
+          !navigator.mediaDevices ||
+          !navigator.mediaDevices.getDisplayMedia
+        ) {
+          notice =
+            "Captura bloqueada: abra esta página por http://127.0.0.1:3000/host.html no Chrome ou Edge.";
+          render();
+          return;
+        }
+
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 60 },
+          },
+          audio: true,
+        });
+
+        preview.srcObject = stream;
+        stream.getVideoTracks()[0].onended = stop;
+
+        const s = stream.getVideoTracks()[0].getSettings();
+        captureInfo = `Captura: ${s.width}x${s.height} @ ${Math.round(s.frameRate)}fps`;
+        outInfo = "";
+        notice = "";
+
+        wanted = true;
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        openSocket();
+        render();
+      }
+
+      function stop() {
+        wanted = false;
+        clearTimeout(retryTimer);
+        closePeers();
+        if (stream) stream.getTracks().forEach((t) => t.stop());
+        if (ws) {
+          ws.onclose = null;
+          ws.close();
+        }
+        stream = null;
+        ws = null;
+        preview.srcObject = null;
+        captureInfo = "";
+        outInfo = "";
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        render();
+      }
+
+      async function pollStats() {
+        const first = peers.values().next().value;
+        if (!first) {
+          outInfo = "";
+          render();
+          return;
+        }
+        const report = await first.getStats();
+        report.forEach((r) => {
+          if (r.type === "outbound-rtp" && r.kind === "video") {
+            let mbps = 0;
+            if (
+              lastTime &&
+              r.timestamp > lastTime &&
+              r.bytesSent >= lastBytes
+            ) {
+              mbps =
+                ((r.bytesSent - lastBytes) * 8) /
+                ((r.timestamp - lastTime) / 1000) /
+                1e6;
+            }
+            lastBytes = r.bytesSent;
+            lastTime = r.timestamp;
+            const limit = r.qualityLimitationReason || "none";
+            outInfo = `Envio: ${r.frameWidth || 0}x${r.frameHeight || 0} @ ${Math.round(r.framesPerSecond || 0)}fps, ${mbps.toFixed(1)} Mbps, limitado por: ${limit}`;
+          }
+        });
+        render();
+      }
+
+      fetch("/config")
+        .then((r) => r.json())
+        .then((c) => {
+          iceServers = c.iceServers;
+        });
+
+      setInterval(() => pollStats().catch(() => {}), 1000);
+      startBtn.onclick = () =>
+        start().catch((e) => {
+          if (e && e.name === "NotAllowedError") {
+            notice =
+              "Compartilhamento cancelado ou bloqueado. Clique em Iniciar, escolha uma tela e confirme em Compartilhar.";
+          } else {
+            notice = `Não foi possível iniciar a captura: ${e && e.name}${e && e.message ? " - " + e.message : ""}`;
+          }
+          render();
+          console.error(e);
+        });
+      stopBtn.onclick = stop;
+    </script>
+  </body>
 </html>
