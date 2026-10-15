@@ -1,361 +1,291 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="pt-BR">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Compartilhar tela</title>
-    <style>
-      body {
-        margin: 0;
-        background: #111;
-        color: #eee;
-        font-family: system-ui, sans-serif;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 12px;
-        padding: 16px;
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compartilhar tela</title>
+<style>
+  body { margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 16px; }
+  video { width: 100%; max-width: 960px; background: #000; border-radius: 8px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  button, select, input { padding: 10px 14px; font-size: 15px; border-radius: 6px; border: 0; }
+  button { background: #3b82f6; color: #fff; cursor: pointer; }
+  button:disabled { background: #444; cursor: default; }
+  #stats { font-family: monospace; font-size: 13px; opacity: .85; text-align: center; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div class="row">
+  <input id="key" type="password" placeholder="HOST_KEY">
+  <button id="start">Iniciar compartilhamento</button>
+  <button id="stop" disabled>Parar</button>
+</div>
+<div class="row">
+  <label>Codec
+    <select id="codec">
+      <option value="VP8" selected>VP8 (leve em software)</option>
+      <option value="H264">H264 (melhor no celular)</option>
+      <option value="VP9">VP9 (pesado)</option>
+    </select>
+  </label>
+  <label>Bitrate
+    <select id="bitrate">
+      <option value="5000000">5 Mbps</option>
+      <option value="10000000">10 Mbps</option>
+      <option value="15000000" selected>15 Mbps</option>
+      <option value="25000000">25 Mbps</option>
+      <option value="40000000">40 Mbps</option>
+    </select>
+  </label>
+</div>
+<video id="preview" autoplay muted playsinline></video>
+<div id="stats">Parado</div>
+
+<script>
+const startBtn = document.getElementById('start');
+const stopBtn = document.getElementById('stop');
+const bitrateSel = document.getElementById('bitrate');
+const codecSel = document.getElementById('codec');
+const keyInput = document.getElementById('key');
+const preview = document.getElementById('preview');
+const statsEl = document.getElementById('stats');
+
+let ws = null;
+let stream = null;
+let wanted = false;
+let retryTimer = null;
+let queue = Promise.resolve();
+let iceServers = [];
+let captureInfo = '';
+let outInfo = '';
+let notice = '';
+let lastBytes = 0;
+let lastTime = 0;
+const peers = new Map();
+
+function send(data) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
+}
+
+function render() {
+  const first = peers.values().next().value;
+  const state = first ? first.connectionState : 'sem espectador';
+  const lines = [captureInfo, `Espectador: ${state}`, outInfo, notice].filter(Boolean);
+  statsEl.innerHTML = lines.join('<br>');
+}
+
+async function tuneSender(sender) {
+  const params = sender.getParameters();
+  if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+  params.encodings[0].maxBitrate = Number(bitrateSel.value);
+  params.encodings[0].maxFramerate = 60;
+  params.degradationPreference = 'maintain-framerate';
+  try {
+    await sender.setParameters(params);
+  } catch (e) {
+    console.warn(e);
+  }
+}
+
+function preferCodec(pc) {
+  const wanted = 'video/' + codecSel.value.toLowerCase();
+  const transceiver = pc.getTransceivers().find((t) => t.sender.track && t.sender.track.kind === 'video');
+  if (!transceiver || !transceiver.setCodecPreferences) return;
+  const codecs = RTCRtpSender.getCapabilities('video').codecs;
+  const first = codecs.filter((c) => c.mimeType.toLowerCase() === wanted);
+  const rest = codecs.filter((c) => c.mimeType.toLowerCase() !== wanted);
+  if (first.length) transceiver.setCodecPreferences([...first, ...rest]);
+}
+
+async function createPeer(id) {
+  if (peers.has(id)) removePeer(id);
+  const pc = new RTCPeerConnection({ iceServers });
+  peers.set(id, pc);
+  lastTime = 0;
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) send({ type: 'candidate', to: id, candidate: e.candidate });
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'failed') {
+      notice = 'Falha na conexão direta. Se persistir, configure um servidor TURN.';
+    }
+    if (pc.connectionState === 'connected') notice = '';
+    render();
+  };
+
+  stream.getTracks().forEach((track) => {
+    if (track.kind === 'video') track.contentHint = 'motion';
+    pc.addTrack(track, stream);
+  });
+
+  preferCodec(pc);
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  send({ type: 'offer', to: id, sdp: pc.localDescription });
+  render();
+}
+
+function removePeer(id) {
+  const pc = peers.get(id);
+  if (pc) pc.close();
+  peers.delete(id);
+  lastTime = 0;
+  render();
+}
+
+function closePeers() {
+  peers.forEach((pc) => pc.close());
+  peers.clear();
+  lastTime = 0;
+  render();
+}
+
+async function handle(msg) {
+  if (msg.type === 'denied') {
+    notice = msg.blocked ? 'Muitas tentativas erradas. Aguarde 10 minutos.' : 'HOST_KEY incorreta.';
+    stop();
+    return;
+  }
+
+  if (msg.type === 'viewer-joined') await createPeer(msg.id);
+
+  if (msg.type === 'answer') {
+    const pc = peers.get(msg.from);
+    if (!pc || !msg.sdp) return;
+    await pc.setRemoteDescription(msg.sdp);
+    pc.getSenders().filter((s) => s.track && s.track.kind === 'video').forEach(tuneSender);
+  }
+
+  if (msg.type === 'candidate') {
+    const pc = peers.get(msg.from);
+    if (pc && pc.remoteDescription && msg.candidate) {
+      await pc.addIceCandidate(msg.candidate).catch(() => {});
+    }
+  }
+
+  if (msg.type === 'viewer-left') removePeer(msg.id);
+}
+
+function openSocket() {
+  clearTimeout(retryTimer);
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}`);
+  ws.onopen = () => {
+    notice = '';
+    send({ type: 'host', key: keyInput.value });
+  };
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    queue = queue.then(() => handle(msg)).catch(console.error);
+  };
+  ws.onclose = () => {
+    if (!wanted) return;
+    closePeers();
+    notice = 'Reconectando ao servidor...';
+    render();
+    retryTimer = setTimeout(openSocket, 3000);
+  };
+}
+
+async function start() {
+  if (!keyInput.value) {
+    notice = 'Informe a HOST_KEY.';
+    render();
+    return;
+  }
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    notice = 'Captura bloqueada: abra esta página por http://127.0.0.1:3000/host.html no Chrome ou Edge.';
+    render();
+    return;
+  }
+
+  stream = await navigator.mediaDevices.getDisplayMedia({
+    video: {
+      width: { ideal: 1920 },
+      height: { ideal: 1080 },
+      frameRate: { ideal: 60 }
+    },
+    audio: true
+  });
+
+  preview.srcObject = stream;
+  stream.getVideoTracks()[0].onended = stop;
+
+  const s = stream.getVideoTracks()[0].getSettings();
+  captureInfo = `Captura: ${s.width}x${s.height} @ ${Math.round(s.frameRate)}fps`;
+  outInfo = '';
+  notice = '';
+
+  wanted = true;
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  openSocket();
+  render();
+}
+
+function stop() {
+  wanted = false;
+  clearTimeout(retryTimer);
+  closePeers();
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  if (ws) {
+    ws.onclose = null;
+    ws.close();
+  }
+  stream = null;
+  ws = null;
+  preview.srcObject = null;
+  captureInfo = '';
+  outInfo = '';
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  render();
+}
+
+async function pollStats() {
+  const first = peers.values().next().value;
+  if (!first) {
+    outInfo = '';
+    render();
+    return;
+  }
+  const report = await first.getStats();
+  report.forEach((r) => {
+    if (r.type === 'outbound-rtp' && r.kind === 'video') {
+      let mbps = 0;
+      if (lastTime && r.timestamp > lastTime && r.bytesSent >= lastBytes) {
+        mbps = ((r.bytesSent - lastBytes) * 8) / ((r.timestamp - lastTime) / 1000) / 1e6;
       }
-      video {
-        width: 100%;
-        max-width: 960px;
-        background: #000;
-        border-radius: 8px;
-      }
-      .row {
-        display: flex;
-        gap: 8px;
-        align-items: center;
-        flex-wrap: wrap;
-        justify-content: center;
-      }
-      button,
-      select,
-      input {
-        padding: 10px 14px;
-        font-size: 15px;
-        border-radius: 6px;
-        border: 0;
-      }
-      button {
-        background: #3b82f6;
-        color: #fff;
-        cursor: pointer;
-      }
-      button:disabled {
-        background: #444;
-        cursor: default;
-      }
-      #stats {
-        font-family: monospace;
-        font-size: 13px;
-        opacity: 0.85;
-        text-align: center;
-        line-height: 1.6;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="row">
-      <input id="key" type="password" placeholder="HOST_KEY" />
-      <button id="start">Iniciar compartilhamento</button>
-      <button id="stop" disabled>Parar</button>
-    </div>
-    <div class="row">
-      <label
-        >Codec
-        <select id="codec">
-          <option value="VP8" selected>VP8 (leve em software)</option>
-          <option value="H264">H264 (melhor no celular)</option>
-          <option value="VP9">VP9 (pesado)</option>
-        </select>
-      </label>
-      <label
-        >Bitrate
-        <select id="bitrate">
-          <option value="5000000">5 Mbps</option>
-          <option value="10000000">10 Mbps</option>
-          <option value="15000000" selected>15 Mbps</option>
-          <option value="25000000">25 Mbps</option>
-          <option value="40000000">40 Mbps</option>
-        </select>
-      </label>
-    </div>
-    <video id="preview" autoplay muted playsinline></video>
-    <div id="stats">Parado</div>
+      lastBytes = r.bytesSent;
+      lastTime = r.timestamp;
+      const limit = r.qualityLimitationReason || 'none';
+      outInfo = `Envio: ${r.frameWidth || 0}x${r.frameHeight || 0} @ ${Math.round(r.framesPerSecond || 0)}fps, ${mbps.toFixed(1)} Mbps, limitado por: ${limit}`;
+    }
+  });
+  render();
+}
 
-    <script>
-      const startBtn = document.getElementById("start");
-      const stopBtn = document.getElementById("stop");
-      const bitrateSel = document.getElementById("bitrate");
-      const codecSel = document.getElementById("codec");
-      const keyInput = document.getElementById("key");
-      const preview = document.getElementById("preview");
-      const statsEl = document.getElementById("stats");
+fetch('/config')
+  .then((r) => r.json())
+  .then((c) => {
+    iceServers = c.iceServers;
+  });
 
-      let ws = null;
-      let stream = null;
-      let wanted = false;
-      let retryTimer = null;
-      let queue = Promise.resolve();
-      let iceServers = [];
-      let captureInfo = "";
-      let outInfo = "";
-      let notice = "";
-      let lastBytes = 0;
-      let lastTime = 0;
-      const peers = new Map();
-
-      function send(data) {
-        if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
-      }
-
-      function render() {
-        const first = peers.values().next().value;
-        const state = first ? first.connectionState : "sem espectador";
-        const lines = [
-          captureInfo,
-          `Espectador: ${state}`,
-          outInfo,
-          notice,
-        ].filter(Boolean);
-        statsEl.innerHTML = lines.join("<br>");
-      }
-
-      async function tuneSender(sender) {
-        const params = sender.getParameters();
-        if (!params.encodings || !params.encodings.length)
-          params.encodings = [{}];
-        params.encodings[0].maxBitrate = Number(bitrateSel.value);
-        params.encodings[0].maxFramerate = 60;
-        params.degradationPreference = "maintain-framerate";
-        try {
-          await sender.setParameters(params);
-        } catch (e) {
-          console.warn(e);
-        }
-      }
-
-      function preferCodec(pc) {
-        const wanted = "video/" + codecSel.value.toLowerCase();
-        const transceiver = pc
-          .getTransceivers()
-          .find((t) => t.sender.track && t.sender.track.kind === "video");
-        if (!transceiver || !transceiver.setCodecPreferences) return;
-        const codecs = RTCRtpSender.getCapabilities("video").codecs;
-        const first = codecs.filter((c) => c.mimeType.toLowerCase() === wanted);
-        const rest = codecs.filter((c) => c.mimeType.toLowerCase() !== wanted);
-        if (first.length) transceiver.setCodecPreferences([...first, ...rest]);
-      }
-
-      async function createPeer(id) {
-        if (peers.has(id)) removePeer(id);
-        const pc = new RTCPeerConnection({ iceServers });
-        peers.set(id, pc);
-        lastTime = 0;
-
-        pc.onicecandidate = (e) => {
-          if (e.candidate)
-            send({ type: "candidate", to: id, candidate: e.candidate });
-        };
-
-        pc.onconnectionstatechange = () => {
-          if (pc.connectionState === "failed") {
-            notice =
-              "Falha na conexão direta. Se persistir, configure um servidor TURN.";
-          }
-          if (pc.connectionState === "connected") notice = "";
-          render();
-        };
-
-        stream.getTracks().forEach((track) => {
-          if (track.kind === "video") track.contentHint = "motion";
-          pc.addTrack(track, stream);
-        });
-
-        preferCodec(pc);
-
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        send({ type: "offer", to: id, sdp: pc.localDescription });
-        render();
-      }
-
-      function removePeer(id) {
-        const pc = peers.get(id);
-        if (pc) pc.close();
-        peers.delete(id);
-        lastTime = 0;
-        render();
-      }
-
-      function closePeers() {
-        peers.forEach((pc) => pc.close());
-        peers.clear();
-        lastTime = 0;
-        render();
-      }
-
-      async function handle(msg) {
-        if (msg.type === "denied") {
-          notice = msg.blocked
-            ? "Muitas tentativas erradas. Aguarde 10 minutos."
-            : "HOST_KEY incorreta.";
-          stop();
-          return;
-        }
-
-        if (msg.type === "viewer-joined") await createPeer(msg.id);
-
-        if (msg.type === "answer") {
-          const pc = peers.get(msg.from);
-          if (!pc || !msg.sdp) return;
-          await pc.setRemoteDescription(msg.sdp);
-          pc.getSenders()
-            .filter((s) => s.track && s.track.kind === "video")
-            .forEach(tuneSender);
-        }
-
-        if (msg.type === "candidate") {
-          const pc = peers.get(msg.from);
-          if (pc && pc.remoteDescription && msg.candidate) {
-            await pc.addIceCandidate(msg.candidate).catch(() => {});
-          }
-        }
-
-        if (msg.type === "viewer-left") removePeer(msg.id);
-      }
-
-      function openSocket() {
-        clearTimeout(retryTimer);
-        const proto = location.protocol === "https:" ? "wss" : "ws";
-        ws = new WebSocket(`${proto}://${location.host}`);
-        ws.onopen = () => {
-          notice = "";
-          send({ type: "host", key: keyInput.value });
-        };
-        ws.onmessage = (ev) => {
-          const msg = JSON.parse(ev.data);
-          queue = queue.then(() => handle(msg)).catch(console.error);
-        };
-        ws.onclose = () => {
-          if (!wanted) return;
-          closePeers();
-          notice = "Reconectando ao servidor...";
-          render();
-          retryTimer = setTimeout(openSocket, 3000);
-        };
-      }
-
-      async function start() {
-        if (!keyInput.value) {
-          notice = "Informe a HOST_KEY.";
-          render();
-          return;
-        }
-
-        if (
-          !navigator.mediaDevices ||
-          !navigator.mediaDevices.getDisplayMedia
-        ) {
-          notice =
-            "Captura bloqueada: abra esta página por http://127.0.0.1:3000/host.html no Chrome ou Edge.";
-          render();
-          return;
-        }
-
-        stream = await navigator.mediaDevices.getDisplayMedia({
-          video: {
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
-            frameRate: { ideal: 60 },
-          },
-          audio: true,
-        });
-
-        preview.srcObject = stream;
-        stream.getVideoTracks()[0].onended = stop;
-
-        const s = stream.getVideoTracks()[0].getSettings();
-        captureInfo = `Captura: ${s.width}x${s.height} @ ${Math.round(s.frameRate)}fps`;
-        outInfo = "";
-        notice = "";
-
-        wanted = true;
-        startBtn.disabled = true;
-        stopBtn.disabled = false;
-        openSocket();
-        render();
-      }
-
-      function stop() {
-        wanted = false;
-        clearTimeout(retryTimer);
-        closePeers();
-        if (stream) stream.getTracks().forEach((t) => t.stop());
-        if (ws) {
-          ws.onclose = null;
-          ws.close();
-        }
-        stream = null;
-        ws = null;
-        preview.srcObject = null;
-        captureInfo = "";
-        outInfo = "";
-        startBtn.disabled = false;
-        stopBtn.disabled = true;
-        render();
-      }
-
-      async function pollStats() {
-        const first = peers.values().next().value;
-        if (!first) {
-          outInfo = "";
-          render();
-          return;
-        }
-        const report = await first.getStats();
-        report.forEach((r) => {
-          if (r.type === "outbound-rtp" && r.kind === "video") {
-            let mbps = 0;
-            if (
-              lastTime &&
-              r.timestamp > lastTime &&
-              r.bytesSent >= lastBytes
-            ) {
-              mbps =
-                ((r.bytesSent - lastBytes) * 8) /
-                ((r.timestamp - lastTime) / 1000) /
-                1e6;
-            }
-            lastBytes = r.bytesSent;
-            lastTime = r.timestamp;
-            const limit = r.qualityLimitationReason || "none";
-            outInfo = `Envio: ${r.frameWidth || 0}x${r.frameHeight || 0} @ ${Math.round(r.framesPerSecond || 0)}fps, ${mbps.toFixed(1)} Mbps, limitado por: ${limit}`;
-          }
-        });
-        render();
-      }
-
-      fetch("/config")
-        .then((r) => r.json())
-        .then((c) => {
-          iceServers = c.iceServers;
-        });
-
-      setInterval(() => pollStats().catch(() => {}), 1000);
-      startBtn.onclick = () =>
-        start().catch((e) => {
-          if (e && e.name === "NotAllowedError") {
-            notice =
-              "Compartilhamento cancelado ou bloqueado. Clique em Iniciar, escolha uma tela e confirme em Compartilhar.";
-          } else {
-            notice = `Não foi possível iniciar a captura: ${e && e.name}${e && e.message ? " - " + e.message : ""}`;
-          }
-          render();
-          console.error(e);
-        });
-      stopBtn.onclick = stop;
-    </script>
-  </body>
+setInterval(() => pollStats().catch(() => {}), 1000);
+startBtn.onclick = () => start().catch((e) => {
+  if (e && e.name === 'NotAllowedError') {
+    notice = 'Compartilhamento cancelado ou bloqueado. Clique em Iniciar, escolha uma tela e confirme em Compartilhar.';
+  } else {
+    notice = `Não foi possível iniciar a captura: ${e && e.name}${e && e.message ? ' - ' + e.message : ''}`;
+  }
+  render();
+  console.error(e);
+});
+stopBtn.onclick = stop;
+</script>
+</body>
 </html>
