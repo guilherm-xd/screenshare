@@ -101,7 +101,7 @@ notepad .env
 cp .env.example .env
 ```
 
-5. Edite o arquivo colocando as chaves geradas, sem aspas, sem espaços e sem o caractere `#`:
+5. Edite o arquivo colocando as chaves geradas, sem aspas, sem espaços e sem o caracteres extras:
 
 ```
 HOST_KEY=primeira-chave-gerada
@@ -130,7 +130,7 @@ npm run tunnel
 
 4. No **Chrome ou Edge**, abra `http://127.0.0.1:3000/host.html`, digite a `HOST_KEY` e clique em **Iniciar compartilhamento**.
 
-5. Na janela de seleção, escolha **Tela inteira** e marque **Compartilhar áudio do sistema**. Sem isso, não há som.
+5. Na janela de seleção, escolha o que deve ser compartilhado e marque **Compartilhar áudio do sistema** caso queira compartilhar áudio.
 
 6. Envie à outra pessoa o endereço do túnel e a `VIEW_KEY`. Ela abre o endereço, digita a chave e assiste. No celular, basta tocar em **Ativar som**.
 
@@ -179,7 +179,6 @@ Não use `#` nos valores. Reinicie o `npm start` depois de editar.
 
 ## Segurança
 
-- **Nunca envie o `.env` ao GitHub.** O `.gitignore` já o bloqueia, mas confira com `git status` antes de cada commit.
 - Quem tem a `VIEW_KEY` vê a sua tela inteira. Compartilhe a chave só com quem você confia e troque-a com `npm run genkey` se ela vazar.
 - O servidor escuta apenas em `127.0.0.1`, então só é acessível pelo túnel.
 - O endereço do túnel é público enquanto ele estiver aberto. Feche o túnel quando não estiver transmitindo.
@@ -188,8 +187,8 @@ Não use `#` nos valores. Reinicie o `npm start` depois de editar.
 
 ## Limitações
 
-- Feito para **uma pessoa transmitindo e uma assistindo**.
-- Quem transmite precisa usar **Chrome ou Edge**. O Firefox não captura o áudio do sistema no compartilhamento de tela.
+- Feito para **uma pessoa transmitindo e uma assistindo**, por enquanto.
+- Quem transmite precisa usar **Chrome ou Edge**. Navegadores como o Firefox não capturam o áudio do sistema no compartilhamento de tela.
 - O endereço do túnel muda toda vez que ele é reiniciado, então é preciso enviar o link novo a cada sessão.
 - Em redes restritivas (alguns dados móveis, redes corporativas) a conexão direta pode falhar e exigir um servidor TURN.
 - Foi testado no Windows, transmitindo pelo Edge para um celular. Outros cenários podem precisar de ajustes.
