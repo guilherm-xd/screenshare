@@ -331,7 +331,7 @@
             lastBytes = r.bytesSent;
             lastTime = r.timestamp;
             const limit = r.qualityLimitationReason || "none";
-            outInfo = `Envio: ${r.frameWidth || 0}x${r.frameHeight || 0} @ ${Math.round(r.framesPerSecond || 0)}fps, ${mbps.toFixed(1)} Mbps, limitado por: ${limit}`;
+            outInfo = `Envio: ${r.frameWidth || 0}x${r.frameHeight || 0} @ ${Math.round(r.framesPerSecond || 0)}fps, ${mbps.toFixed(1)} Mbps, limitado por: ${limit}, codificador: ${r.encoderImplementation || "desconhecido"}`;
           }
         });
         render();
@@ -356,6 +356,24 @@
           console.error(e);
         });
       stopBtn.onclick = stop;
+
+      bitrateSel.onchange = () => {
+        peers.forEach((pc) => {
+          pc.getSenders()
+            .filter((sender) => sender.track && sender.track.kind === "video")
+            .forEach(tuneSender);
+        });
+      };
+
+      codecSel.onchange = () => {
+        if (!stream) return;
+        const ids = [...peers.keys()];
+        queue = queue
+          .then(async () => {
+            for (const id of ids) await createPeer(id);
+          })
+          .catch(console.error);
+      };
     </script>
   </body>
 </html>
