@@ -90,6 +90,15 @@
         min-height: 18px;
         text-align: center;
       }
+      #serverWarning {
+        width: 100%;
+        max-width: 320px;
+        margin: 0;
+        color: #d1d5db;
+        font-size: 13px;
+        line-height: 1.4;
+        text-align: center;
+      }
     </style>
   </head>
   <body>
@@ -108,8 +117,19 @@
         placeholder="Endereço do servidor"
         autocapitalize="off"
         autocorrect="off"
+        autocomplete="url"
+        spellcheck="false"
       />
-      <input id="key" type="password" placeholder="Chave de acesso" />
+      <p id="serverWarning">
+        Confira o endereço do servidor e só informe a chave se você confiar
+        nele.
+      </p>
+      <input
+        id="key"
+        type="password"
+        placeholder="Chave de acesso"
+        autocomplete="current-password"
+      />
       <button id="enter">Entrar</button>
     </div>
 
@@ -122,22 +142,40 @@
       const serverInput = document.getElementById("server");
       const keyInput = document.getElementById("key");
 
-      const params = new URLSearchParams(location.search);
-      const onPages = location.hostname.endsWith("github.io");
+      const onPages =
+        location.hostname === "github.io" ||
+        location.hostname.endsWith(".github.io");
 
       function normalize(value) {
-        return value
-          .trim()
-          .replace(/^[a-z]+:\/\//i, "")
-          .replace(/\/.*$/, "");
+        const input = value.trim();
+        if (!input) return "";
+        const address = /^[a-z][a-z0-9+.-]*:\/\//i.test(input)
+          ? input
+          : `https://${input}`;
+        const parsed = new URL(address);
+        if (
+          !["http:", "https:"].includes(parsed.protocol) ||
+          parsed.username ||
+          parsed.password ||
+          parsed.pathname !== "/" ||
+          parsed.search ||
+          parsed.hash
+        ) {
+          throw new Error(
+            "Informe somente o endereço do servidor, sem caminho ou credenciais.",
+          );
+        }
+        if (
+          parsed.protocol === "http:" &&
+          !["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)
+        ) {
+          throw new Error("Use HTTPS para servidores que não sejam locais.");
+        }
+        return parsed.host;
       }
 
-      let server = params.get("s")
-        ? normalize(params.get("s"))
-        : onPages
-          ? ""
-          : location.host;
-      const serverLocked = !!server;
+      let server = onPages ? "" : location.host;
+      serverInput.value = server;
 
       let viewerKey = "";
       let iceServers = [];
@@ -165,8 +203,28 @@
 
       function showGate(message) {
         msgEl.textContent = message || "";
-        serverInput.style.display = serverLocked ? "none" : "";
+        serverInput.style.display = "";
         gate.style.display = "flex";
+      }
+
+      async function loadIceServers(key) {
+        const res = await fetch(`${endpoints().http}/config`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          cache: "no-store",
+          body: JSON.stringify({ key }),
+        });
+        const config = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const error = new Error(
+            config.error || "Não foi possível validar a chave.",
+          );
+          error.status = res.status;
+          throw error;
+        }
+        if (!Array.isArray(config.iceServers))
+          throw new Error("Configuração do servidor inválida.");
+        iceServers = config.iceServers;
       }
 
       function send(data) {
@@ -294,27 +352,50 @@
           closePeer();
           pendingCandidates = [];
           setStatus("Reconectando...");
-          retryTimer = setTimeout(connect, 3000);
+          retryTimer = setTimeout(reconnect, 3000);
         };
       }
 
+      async function reconnect() {
+        if (stopped || !viewerKey) return;
+        try {
+          await loadIceServers(viewerKey);
+          connect();
+        } catch (error) {
+          if (error.status === 401 || error.status === 429) {
+            stopped = true;
+            viewerKey = "";
+            showGate(error.message);
+            return;
+          }
+          setStatus("Reconectando...");
+          retryTimer = setTimeout(reconnect, 3000);
+        }
+      }
+
       async function enter() {
-        if (!serverLocked) server = normalize(serverInput.value);
+        try {
+          server = normalize(serverInput.value);
+        } catch (error) {
+          msgEl.textContent = error.message || "Endereço do servidor inválido.";
+          return;
+        }
         if (!server) {
-          msgEl.textContent = "Informe o endereço do servidor";
+          msgEl.textContent = "Informe o endereço do servidor.";
           return;
         }
         if (!keyInput.value) {
-          msgEl.textContent = "Informe a chave de acesso";
+          msgEl.textContent = "Informe a chave de acesso.";
           return;
         }
         viewerKey = keyInput.value;
         try {
-          const res = await fetch(`${endpoints().http}/config`);
-          const config = await res.json();
-          iceServers = config.iceServers;
-        } catch (e) {
-          msgEl.textContent = "Não foi possível alcançar o servidor";
+          await loadIceServers(viewerKey);
+        } catch (error) {
+          msgEl.textContent =
+            error.status === 401 || error.status === 429
+              ? error.message
+              : "Não foi possível alcançar o servidor ou a origem não está autorizada.";
           return;
         }
         gate.style.display = "none";

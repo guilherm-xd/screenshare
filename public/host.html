@@ -46,12 +46,26 @@
         background: #444;
         cursor: default;
       }
+      input[type="checkbox"] {
+        width: 18px;
+        height: 18px;
+        padding: 0;
+      }
+      .hint {
+        max-width: 640px;
+        margin: 0;
+        font-size: 13px;
+        opacity: 0.75;
+        text-align: center;
+        line-height: 1.5;
+      }
       #stats {
         font-family: monospace;
         font-size: 13px;
         opacity: 0.85;
         text-align: center;
         line-height: 1.6;
+        white-space: pre-line;
       }
     </style>
   </head>
@@ -81,6 +95,18 @@
         </select>
       </label>
     </div>
+    <div class="row">
+      <label>
+        <input id="comm" type="checkbox" />
+        Escutar comunicação
+      </label>
+    </div>
+    <p class="hint">
+      Desligada, o host pede só o áudio da janela compartilhada, o que deixa o
+      Discord e apps de chamada de fora. Ligada, o áudio de todo o sistema vai
+      junto. Vale ao iniciar o compartilhamento e só funciona ao compartilhar
+      uma janela: a tela inteira sempre envia todo o áudio do sistema.
+    </p>
     <video id="preview" autoplay muted playsinline></video>
     <div id="stats">Parado</div>
 
@@ -92,6 +118,7 @@
       const keyInput = document.getElementById("key");
       const preview = document.getElementById("preview");
       const statsEl = document.getElementById("stats");
+      const commCheck = document.getElementById("comm");
 
       let ws = null;
       let stream = null;
@@ -109,7 +136,28 @@
       let levelMax = 0;
       let levelInfo = "";
       let audioInfo = "";
+      let commInfo = "";
       const peers = new Map();
+
+      async function loadIceServers(key) {
+        const response = await fetch("/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          cache: "no-store",
+          body: JSON.stringify({ key }),
+        });
+        const config = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const error = new Error(
+            config.error || "Não foi possível validar a HOST_KEY.",
+          );
+          error.status = response.status;
+          throw error;
+        }
+        if (!Array.isArray(config.iceServers))
+          throw new Error("Configuração ICE inválida.");
+        iceServers = config.iceServers;
+      }
 
       function send(data) {
         if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
@@ -120,13 +168,14 @@
         const state = first ? first.connectionState : "sem espectador";
         const lines = [
           captureInfo,
+          commInfo,
           levelInfo,
           `Espectador: ${state}`,
           outInfo,
           audioInfo,
           notice,
         ].filter(Boolean);
-        statsEl.innerHTML = lines.join("<br>");
+        statsEl.textContent = lines.join("\n");
       }
 
       async function tuneSender(sender) {
@@ -250,13 +299,39 @@
           closePeers();
           notice = "Reconectando ao servidor...";
           render();
-          retryTimer = setTimeout(openSocket, 3000);
+          retryTimer = setTimeout(reconnectSocket, 3000);
         };
+      }
+
+      async function reconnectSocket() {
+        if (!wanted) return;
+        try {
+          await loadIceServers(keyInput.value);
+          openSocket();
+        } catch (error) {
+          if (error.status === 401 || error.status === 429) {
+            notice = error.message;
+            render();
+            stop();
+            return;
+          }
+          notice = "Reconectando ao servidor...";
+          render();
+          retryTimer = setTimeout(reconnectSocket, 3000);
+        }
       }
 
       async function start() {
         if (!keyInput.value) {
           notice = "Informe a HOST_KEY.";
+          render();
+          return;
+        }
+
+        try {
+          await loadIceServers(keyInput.value);
+        } catch (error) {
+          notice = error.message || "Não foi possível validar a HOST_KEY.";
           render();
           return;
         }
@@ -282,6 +357,7 @@
             noiseSuppression: false,
             autoGainControl: false,
           },
+          windowAudio: commCheck.checked ? "system" : "window",
         });
 
         preview.srcObject = stream;
@@ -289,6 +365,7 @@
 
         const s = stream.getVideoTracks()[0].getSettings();
         const hasAudio = stream.getAudioTracks().length > 0;
+        commInfo = describeComm(s.displaySurface);
         watchAudio();
         captureInfo = `Captura: ${s.width}x${s.height} @ ${Math.round(s.frameRate)}fps | áudio: ${hasAudio ? "capturado" : "NÃO capturado"}`;
         outInfo = "";
@@ -317,6 +394,7 @@
         ws = null;
         preview.srcObject = null;
         captureInfo = "";
+        commInfo = "";
         outInfo = "";
         startBtn.disabled = false;
         stopBtn.disabled = true;
@@ -394,11 +472,22 @@
         render();
       }
 
-      fetch("/config")
-        .then((r) => r.json())
-        .then((c) => {
-          iceServers = c.iceServers;
-        });
+      function describeComm(surface) {
+        if (commCheck.checked) {
+          return "Comunicação: ligada (áudio de todo o sistema, incluindo chamadas)";
+        }
+        if (surface === "monitor") {
+          return "Comunicação: desligada, mas a tela inteira envia todo o áudio do sistema (Discord incluído). Compartilhe uma janela para deixá-lo de fora.";
+        }
+        return "Comunicação: desligada (pedido só o áudio da janela compartilhada)";
+      }
+
+      commCheck.onchange = () => {
+        if (!stream) return;
+        commInfo =
+          "A mudança em Escutar comunicação vale na próxima vez que você iniciar o compartilhamento.";
+        render();
+      };
 
       setInterval(() => pollStats().catch(() => {}), 1000);
       setInterval(() => {

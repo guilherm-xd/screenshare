@@ -12,7 +12,7 @@
     "genkey": "node -e \"console.log(require('crypto').randomBytes(18).toString('hex'))\""
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "ws": "^8.18.0"
+    "express": "4.22.3",
+    "ws": "8.22.0"
   }
 }
