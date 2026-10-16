@@ -237,4 +237,4 @@ O campo opcional `ICE_SERVERS` ainda permite servidores ICE personalizados em JS
 
 ## Autor
 
-[Guilherme Miranda Murillo](https://github.com/guilherm-xd)
+<img src="https://avatars.githubusercontent.com/u/68977822" width="24" align="absmiddle"> [Guilherme Miranda Murillo](https://github.com/guilherm-xd)
